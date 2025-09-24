@@ -94,6 +94,21 @@ def synthesize_text_gtts(text, speaker_id=0):
         temp_filename = f"temp_gtts_{int(time.time()*1000)}_{speaker_id}.mp3"
         temp_filepath = os.path.join(OUTPUT_DIR, temp_filename)
         tts.save(temp_filepath)
+
+        # 男性話者のとき、pydub が使える環境では少しだけピッチを下げて男性っぽく加工
+        if speaker_id == VOICE_ID_man and AUDIO_MERGE_AVAILABLE:
+            try:
+                audio_seg = AudioSegment.from_file(temp_filepath)
+                # おおよそ -2 semitones 相当（約 0.89 倍）。
+                # frame_rate を下げてから元の frame_rate に戻すことでピッチのみ変化させる手法。
+                lowered = audio_seg._spawn(audio_seg.raw_data, overrides={
+                    "frame_rate": int(audio_seg.frame_rate * 0.89)
+                }).set_frame_rate(audio_seg.frame_rate)
+                lowered.export(temp_filepath, format="mp3")
+                print("男性（gTTSフォールバック）用にピッチを少し下げました:", temp_filepath)
+            except Exception as e:
+                print(f"男性用ピッチ加工に失敗（gTTSフォールバック）: {e}")
+        
         return temp_filepath
     except Exception as e:
         print(f"gTTS synth failed: {e}")
