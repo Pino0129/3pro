@@ -102,7 +102,7 @@ def synthesize_text_gtts(text, speaker_id=0):
                 # おおよそ -2 semitones 相当（約 0.89 倍）。
                 # frame_rate を下げてから元の frame_rate に戻すことでピッチのみ変化させる手法。
                 lowered = audio_seg._spawn(audio_seg.raw_data, overrides={
-                    "frame_rate": int(audio_seg.frame_rate * 0.89)
+                    "frame_rate": int(audio_seg.frame_rate * 0.6)
                 }).set_frame_rate(audio_seg.frame_rate)
                 lowered.export(temp_filepath, format="mp3")
                 print("男性（gTTSフォールバック）用にピッチを少し下げました:", temp_filepath)
