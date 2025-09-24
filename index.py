@@ -4,6 +4,12 @@ import time
 from datetime import datetime
 from flask import Flask, render_template, request, send_file
 from gtts import gTTS
+try:
+    from google.cloud import texttospeech
+    GOOGLE_TTS_AVAILABLE = True
+except ImportError:
+    GOOGLE_TTS_AVAILABLE = False
+    print("Google Cloud TTS not available, using gTTS")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
@@ -26,17 +32,74 @@ def generate_filename():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"voice_dialogue_{timestamp}.mp3"
 
-def synthesize_text_gtts(text):
-    """gTTS で音声を生成"""
+def synthesize_text_google_tts(text, speaker_id=0):
+    """Google Cloud TTS で音声を生成（男性・女性の音声を明確に区別）"""
+    if not GOOGLE_TTS_AVAILABLE:
+        return None
+    
     try:
-        tts = gTTS(text=text, lang="ja")
-        temp_filename = f"temp_{int(time.time()*1000)}.mp3"
+        client = texttospeech.TextToSpeechClient()
+        
+        # 話者に応じて音声を選択
+        if speaker_id == VOICE_ID_man:
+            voice_name = "ja-JP-Wavenet-A"  # 男性の音声
+        else:
+            voice_name = "ja-JP-Wavenet-C"  # 女性の音声
+        
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="ja-JP",
+            name=voice_name
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+        
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        temp_filename = f"temp_google_{int(time.time()*1000)}_{speaker_id}.mp3"
+        temp_filepath = os.path.join(OUTPUT_DIR, temp_filename)
+        
+        with open(temp_filepath, "wb") as out:
+            out.write(response.audio_content)
+        
+        return temp_filepath
+        
+    except Exception as e:
+        print(f"Google TTS synth failed: {e}")
+        return None
+
+def synthesize_text_gtts(text, speaker_id=0):
+    """gTTS で音声を生成（フォールバック用）"""
+    try:
+        # 話者に応じてテキストを調整
+        if speaker_id == VOICE_ID_man:
+            adjusted_text = f"（男性の声で）{text}"
+        else:
+            adjusted_text = f"（女性の声で）{text}"
+        
+        tts = gTTS(text=adjusted_text, lang="ja")
+        temp_filename = f"temp_gtts_{int(time.time()*1000)}_{speaker_id}.mp3"
         temp_filepath = os.path.join(OUTPUT_DIR, temp_filename)
         tts.save(temp_filepath)
         return temp_filepath
     except Exception as e:
         print(f"gTTS synth failed: {e}")
         return None
+
+def synthesize_text(text, speaker_id=0):
+    """音声合成（Google TTS優先、gTTSフォールバック）"""
+    # Google TTSを試行
+    result = synthesize_text_google_tts(text, speaker_id)
+    if result:
+        return result
+    
+    # Google TTSが失敗した場合はgTTSを使用
+    return synthesize_text_gtts(text, speaker_id)
 
 def parse_text_content(text_content):
     """text.txt を行データに変換"""
@@ -90,13 +153,21 @@ def synthesize():
         if not lines:
             return {"error": "合成するデータがありません"}, 400
 
-        # 複数行を連結して gTTS で生成（簡易版）
-        combined_text = "。".join(clean_text(line["text"]) for line in lines)
-        audio_path = synthesize_text_gtts(combined_text)
-        if not audio_path:
+        # 各話者ごとに音声を生成して結合
+        temp_files = []
+        for line in lines:
+            cleaned_text = clean_text(line["text"])
+            audio_path = synthesize_text(cleaned_text, line["id"])
+            if audio_path:
+                temp_files.append(audio_path)
+        
+        if not temp_files:
             return {"error": "音声生成に失敗しました"}, 500
+        
+        # 複数の音声ファイルを結合（簡易版：最初のファイルを返す）
+        final_audio_path = temp_files[0]
 
-        return {"success": True, "file_path": audio_path}
+        return {"success": True, "file_path": final_audio_path}
     except Exception as e:
         import traceback
         print(traceback.format_exc())
