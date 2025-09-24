@@ -1,2 +1,2 @@
-Flask==2.3.3
+gTTS==2.4.6
 requests==2.31.0
