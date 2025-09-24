@@ -1,4 +1,4 @@
-mport os
+import os
 import re
 import time
 from datetime import datetime
@@ -257,7 +257,7 @@ def get_audio(filename):
 if __name__ == "__main__":
     os.makedirs("templates", exist_ok=True)
     with open("templates/index.html", "w", encoding="utf-8") as f:
-        f.write("""<!DOCTYPE html>
+        f.write('''<!DOCTYPE html>
 <html>
 <head>
     <title>音声合成アプリ (gTTS)</title>
@@ -290,6 +290,60 @@ if __name__ == "__main__":
         }
         function updateDialogueDisplay() {
             const div = document.getElementById('dialogue');
-            div.innerHTML = currentLines.map(line => `
-                <div class="dialogue-line">
-                    <p>テキスト:
+            div.innerHTML = currentLines.map(line => 
+                '<div class="dialogue-line">' +
+                    '<p>テキスト: ' + line.text + '</p>' +
+                    '<p>話者: ' + (line.id===0?"男性":"女性") + '</p>' +
+                '</div>'
+            ).join('');
+        }
+        window.onload = function() {
+            updateDialogueDisplay();
+            if(currentLines.length>0) showStatus('text.txtを読み込みました！');
+        }
+        function playSequential(names) {
+            let idx = 0;
+            const audio = new Audio('/audio/' + names[idx]);
+            audio.addEventListener('ended', () => {
+                idx++;
+                if (idx < names.length) {
+                    audio.src = '/audio/' + names[idx];
+                    audio.play();
+                }
+            });
+            audio.play();
+        }
+        function synthesize() {
+            if(currentLines.length===0) { showStatus('合成データなし',true); return; }
+            showStatus('音声生成中...');
+            document.getElementById('synthesizeButton').disabled=true;
+            fetch('/synthesize',{method:'POST'})
+            .then(r=>r.json())
+            .then(data=>{
+                document.getElementById('synthesizeButton').disabled=false;
+                if(data.error){ showStatus('エラー: '+data.error,true); return; }
+                showStatus('音声生成完了！');
+
+                // pydubあり: 単一の結合ファイルを再生
+                if (data.combined_filename) {
+                    const audio = new Audio('/audio/' + data.combined_filename);
+                    audio.play();
+                    return;
+                }
+
+                // pydubなし: 複数ファイルを順次再生
+                if (Array.isArray(data.filenames) && data.filenames.length > 0) {
+                    playSequential(data.filenames);
+                    return;
+                }
+
+                showStatus('再生可能なファイルが見つかりませんでした。', true);
+            }).catch(e=>{
+                document.getElementById('synthesizeButton').disabled=false;
+                showStatus('エラー: '+e,true);
+            });
+        }
+    </script>
+</body>
+</html>''')
+    app.run(host='0.0.0.0', port=8001, debug=True)
