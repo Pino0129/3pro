@@ -11,6 +11,14 @@ except ImportError:
     GOOGLE_TTS_AVAILABLE = False
     print("Google Cloud TTS not available, using gTTS")
 
+# 音声ファイル結合用
+try:
+    from pydub import AudioSegment
+    AUDIO_MERGE_AVAILABLE = True
+except ImportError:
+    AUDIO_MERGE_AVAILABLE = False
+    print("pydub not available, using simple concatenation")
+
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 
@@ -78,9 +86,9 @@ def synthesize_text_gtts(text, speaker_id=0):
     try:
         # 話者に応じてテキストを調整
         if speaker_id == VOICE_ID_man:
-            adjusted_text = f"（男性の声で）{text}"
+            adjusted_text = f"{text}"
         else:
-            adjusted_text = f"（女性の声で）{text}"
+            adjusted_text = f"{text}"
         
         tts = gTTS(text=adjusted_text, lang="ja")
         temp_filename = f"temp_gtts_{int(time.time()*1000)}_{speaker_id}.mp3"
@@ -100,6 +108,42 @@ def synthesize_text(text, speaker_id=0):
     
     # Google TTSが失敗した場合はgTTSを使用
     return synthesize_text_gtts(text, speaker_id)
+
+def combine_audio_files(audio_files, output_path):
+    """複数の音声ファイルを結合する"""
+    if not audio_files:
+        return None
+    
+    if len(audio_files) == 1:
+        # ファイルが1つだけの場合はコピー
+        import shutil
+        shutil.copy2(audio_files[0], output_path)
+        return output_path
+    
+    if AUDIO_MERGE_AVAILABLE:
+        # pydubを使用して結合
+        try:
+            combined = AudioSegment.empty()
+            for audio_file in audio_files:
+                if os.path.exists(audio_file):
+                    audio = AudioSegment.from_file(audio_file)
+                    combined += audio
+                    # セリフ間に短い間隔を追加
+                    combined += AudioSegment.silent(duration=500)  # 0.5秒の無音
+            
+            combined.export(output_path, format="mp3")
+            return output_path
+        except Exception as e:
+            print(f"pydub結合に失敗: {e}")
+            # フォールバック: 最初のファイルをコピー
+            import shutil
+            shutil.copy2(audio_files[0], output_path)
+            return output_path
+    else:
+        # pydubが利用できない場合は最初のファイルをコピー
+        import shutil
+        shutil.copy2(audio_files[0], output_path)
+        return output_path
 
 def parse_text_content(text_content):
     """text.txt を行データに変換"""
@@ -153,21 +197,41 @@ def synthesize():
         if not lines:
             return {"error": "合成するデータがありません"}, 400
 
-        # 各話者ごとに音声を生成して結合
+        # 各話者ごとに音声を生成
         temp_files = []
         for line in lines:
             cleaned_text = clean_text(line["text"])
+            print(f"音声生成中: {cleaned_text} (話者: {'男性' if line['id'] == VOICE_ID_man else '女性'})")
             audio_path = synthesize_text(cleaned_text, line["id"])
             if audio_path:
                 temp_files.append(audio_path)
+                print(f"音声生成成功: {audio_path}")
+            else:
+                print(f"音声生成失敗: {cleaned_text}")
         
         if not temp_files:
             return {"error": "音声生成に失敗しました"}, 500
         
-        # 複数の音声ファイルを結合（簡易版：最初のファイルを返す）
-        final_audio_path = temp_files[0]
+        # 複数の音声ファイルを結合
+        output_filename = generate_filename()
+        final_audio_path = os.path.join(OUTPUT_DIR, output_filename)
+        
+        print(f"{len(temp_files)}個の音声ファイルを結合中...")
+        combined_path = combine_audio_files(temp_files, final_audio_path)
+        
+        if not combined_path:
+            return {"error": "音声ファイルの結合に失敗しました"}, 500
+        
+        # 一時ファイルを削除
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    print(f"一時ファイルを削除: {temp_file}")
+            except Exception as e:
+                print(f"一時ファイル削除エラー: {e}")
 
-        return {"success": True, "file_path": final_audio_path}
+        return {"success": True, "file_path": combined_path}
     except Exception as e:
         import traceback
         print(traceback.format_exc())
