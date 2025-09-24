@@ -3,30 +3,27 @@ import re
 import time
 import json
 import wave
-import contextlib
+import base64
+import requests
 from datetime import datetime
 from pathlib import Path
-from flask import Flask, render_template, request, send_file
-from google.cloud import texttospeech
+from flask import Flask, render_template, request, send_file, jsonify
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 
-# --- 音声合成の設定 ---
-# Google Cloud Text-to-Speech を利用します。
-# 必要: 環境変数 GOOGLE_APPLICATION_CREDENTIALS がサービスアカウントの JSON を指すこと
-# pip install google-cloud-texttospeech
-TTS_CLIENT = texttospeech.TextToSpeechClient()
-# 出力フォーマット (LINEAR16 -> wav)
-AUDIO_ENCODING = texttospeech.AudioEncoding.LINEAR16
+# --- Gemini TTS 設定 ---
+API_KEY = os.environ.get("GEMINI_API_KEY")
+TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+# 出力フォーマット
 OUTPUT_SAMPLING_RATE = 44100
 
-# スピーカーIDの定義（元プログラムに合わせる）
 VOICE_ID_man = 0
 VOICE_ID_woman = 1
 
 def clean_text(text):
-    """テキストをクリーニングする"""
+    """テキストをクリーニング"""
     text = re.sub(r'^セリフ:\s*', '', text)
     return text.strip()
 
@@ -43,7 +40,7 @@ def generate_filename():
     return f"voice_dialogue_{timestamp}.wav"
 
 def combine_wav_files(wav_files, output_path):
-    """複数のWAVファイルを結合する（同一フォーマット前提）"""
+    """複数のWAVファイルを結合"""
     if not wav_files:
         raise ValueError("wav_files is empty")
     with wave.open(wav_files[0], 'rb') as first_file:
@@ -58,113 +55,57 @@ def combine_wav_files(wav_files, output_path):
             with wave.open(wav_file, 'rb') as infile:
                 frames = infile.readframes(infile.getnframes())
                 output_file.writeframes(frames)
-                # ファイル間に短い無音(0.5s)を挿入
                 if i != len(wav_files) - 1:
                     silence_duration = 0.5
                     silence_frames = int(silence_duration * frame_rate)
                     silence_data = b'\x00' * (silence_frames * n_channels * sample_width)
                     output_file.writeframes(silence_data)
 
-def synthesize_text_with_google(text, voice_name="ja-JP-Wavenet-A", speaking_rate=1.0, pitch=0.0):
+def synthesize_text_with_gemini(text):
     """
-    Google Cloud Text-to-Speech を使って単一テキストを WAV で返す。
-    - voice_name: 例 "ja-JP-Wavenet-A"（環境の声リストに合わせて変更）
-    - speaking_rate: 速度 (1.0 が標準)
-    - pitch: ピッチ (単位は semitones、整数/小数可)
-    戻り値: 一時ファイルパス
+    Gemini AI Studio TTS を呼び出して音声を生成する
     """
-    synthesis_input = texttospeech.SynthesisInput(text=text)
-
-    # 日本語の例。必要なら language_code を変更。
-    voice = texttospeech.VoiceSelectionParams(
-        language_code="ja-JP",
-        name=voice_name
-    )
-
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=AUDIO_ENCODING,
-        sample_rate_hertz=OUTPUT_SAMPLING_RATE,
-        speaking_rate=speaking_rate,
-        pitch=pitch
-    )
-
+    headers = {"Content-Type": "application/json", "X-goog-api-key": API_KEY}
+    payload = {
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {"responseMimeType": "audio/wav"}
+    }
     try:
-        response = TTS_CLIENT.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
+        r = requests.post(TTS_URL, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        audio_b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+        audio_bytes = base64.b64decode(audio_b64)
     except Exception as e:
-        print(f"Google TTS synth failed: {e}")
+        print(f"Gemini TTS failed: {e}")
         return None
 
-    temp_filename = f"temp_google_{int(time.time()*1000)}.wav"
+    temp_filename = f"temp_gemini_{int(time.time()*1000)}.wav"
     with open(temp_filename, "wb") as out_f:
-        out_f.write(response.audio_content)
+        out_f.write(audio_bytes)
     return temp_filename
 
-def validate_synthesis_params(params):
-    """簡易バリデーション（速度・ピッチの範囲調整）"""
-    # speaking_rate: Vertex/Cloud の制限に合わせて0.25〜4.0などに制限する例
-    sr = params.get("speed", 1.0)
-    if sr < 0.25:
-        sr = 0.25
-    if sr > 4.0:
-        sr = 4.0
-    params["speed"] = sr
-
-    p = params.get("pitch", 0.0)
-    if p < -20.0:
-        p = -20.0
-    if p > 20.0:
-        p = 20.0
-    params["pitch"] = p
-    return params
-
-def synthesize_dialogue(lines, voice_map=None):
-    """
-    lines: [{'text':..., 'id':..., 'speed':..., 'pitch':...}, ...]
-    voice_map: speaker id -> voice_name (Google voice string)
-    """
-    if voice_map is None:
-        voice_map = {
-            VOICE_ID_man: "ja-JP-Wavenet-A",
-            VOICE_ID_TSUKUYOMI: "ja-JP-Wavenet-B"
-        }
-
+def synthesize_dialogue(lines):
     temp_files = []
     for idx, line in enumerate(lines):
         cleaned = clean_text(line["text"])
         if not cleaned:
             continue
-
-        params = {"speed": line.get("speed", 1.0), "pitch": line.get("pitch", 0.0)}
-        params = validate_synthesis_params(params)
-
-        speaker_id = line.get("id", 0)
-        voice_name = voice_map.get(speaker_id, list(voice_map.values())[0])
-
-        print(f"Synthesizing line {idx}: speaker={speaker_id} voice={voice_name} speed={params['speed']} pitch={params['pitch']}")
-        tmp = synthesize_text_with_google(
-            cleaned,
-            voice_name=voice_name,
-            speaking_rate=params["speed"],
-            pitch=params["pitch"]
-        )
+        print(f"Synthesizing line {idx}: {cleaned}")
+        tmp = synthesize_text_with_gemini(cleaned)
         if tmp:
             temp_files.append(tmp)
         else:
             print(f"Failed to synthesize line {idx}")
 
     if not temp_files:
-        return None, "音声ファイルが生成できませんでした（Google TTS エラー）"
+        return None, "音声ファイルが生成できませんでした（Gemini TTS エラー）"
 
     output_dir = get_output_directory()
     output_filename = generate_filename()
     output_path = os.path.join(output_dir, output_filename)
     combine_wav_files(temp_files, output_path)
 
-    # 一時ファイルを削除
     for t in temp_files:
         try:
             os.remove(t)
@@ -174,12 +115,10 @@ def synthesize_dialogue(lines, voice_map=None):
     return output_path, None
 
 def parse_text_content(text_content):
-    """元の解析ロジックを踏襲して text.txt を行データに変換"""
+    """text.txt を行データに変換"""
     lines = []
     current_speaker = None
     current_text = []
-    current_speed = 1.0
-    current_pitch = 0.0
 
     for raw in text_content.splitlines():
         text = raw.strip()
@@ -188,40 +127,18 @@ def parse_text_content(text_content):
         speaker_match = re.match(r'\[(男性|女性)\]', text)
         if speaker_match:
             if current_speaker is not None and current_text:
-                speaker_id = VOICE_ID_man if current_speaker == "男性" else VOICE_ID_TSUKUYOMI
-                lines.append({
-                    "text": " ".join(current_text),
-                    "id": speaker_id,
-                    "pitch": current_pitch,
-                    "speed": current_speed
-                })
+                speaker_id = VOICE_ID_man if current_speaker == "男性" else VOICE_ID_woman
+                lines.append({"text": " ".join(current_text), "id": speaker_id})
                 current_text = []
             current_speaker = speaker_match.group(1)
-            current_speed = 1.0
-            current_pitch = 0.0
-            continue
-
-        speed_match = re.match(r'速度:\s*([\d.]+)', text)
-        if speed_match:
-            current_speed = float(speed_match.group(1))
-            continue
-
-        pitch_match = re.match(r'ピッチ:\s*([-\d.]+)', text)
-        if pitch_match:
-            current_pitch = float(pitch_match.group(1))
             continue
 
         if current_speaker is not None:
             current_text.append(text)
 
     if current_speaker is not None and current_text:
-        speaker_id = VOICE_ID_man if current_speaker == "男性" else VOICE_ID_TSUKUYOMI
-        lines.append({
-            "text": " ".join(current_text),
-            "id": speaker_id,
-            "pitch": current_pitch,
-            "speed": current_speed
-        })
+        speaker_id = VOICE_ID_man if current_speaker == "男性" else VOICE_ID_woman
+        lines.append({"text": " ".join(current_text), "id": speaker_id})
 
     return lines
 
@@ -243,7 +160,6 @@ def index():
 @app.route("/synthesize", methods=["POST"])
 def synthesize():
     try:
-        # 再度 text.txt を読み込む
         file_path = get_text_file_path()
         if not os.path.exists(file_path):
             return {"error": f"テキストファイルが見つかりません: {file_path}"}, 400
@@ -253,13 +169,7 @@ def synthesize():
         if not lines:
             return {"error": "合成するデータがありません。text.txtの形式を確認してください。"}, 400
 
-        # voice_map を必要なら環境変数等からカスタマイズ可能
-        voice_map = {
-            VOICE_ID_man: os.environ.get('VOICE_MAN', 'ja-JP-Wavenet-A'),
-            VOICE_ID_TSUKUYOMI: os.environ.get('VOICE_TSUKUYOMI', 'ja-JP-Wavenet-B')
-        }
-
-        output_path, error = synthesize_dialogue(lines, voice_map=voice_map)
+        output_path, error = synthesize_dialogue(lines)
         if error:
             return {"error": error}, 500
         return {"success": True, "file_path": output_path}
@@ -277,13 +187,12 @@ def get_audio(filename):
     return send_file(fp, mimetype="audio/wav")
 
 if __name__ == "__main__":
-    # templates/index.html を存在させる（元のHTMLを流用）
     os.makedirs("templates", exist_ok=True)
     with open("templates/index.html", "w", encoding="utf-8") as f:
         f.write("""<!DOCTYPE html>
 <html>
 <head>
-    <title>音声合成アプリ (Google TTS)</title>
+    <title>音声合成アプリ (Gemini TTS)</title>
     <meta charset="utf-8">
     <style>
         body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
@@ -297,7 +206,7 @@ if __name__ == "__main__":
     </style>
 </head>
 <body>
-    <h1>音声合成アプリ (Google TTS)</h1>
+    <h1>音声合成アプリ (Gemini TTS)</h1>
     <div id="status"></div>
     <div class="controls">
         <button onclick="synthesize()" id="synthesizeButton">音声を合成</button>
@@ -316,9 +225,7 @@ if __name__ == "__main__":
             dialogueDiv.innerHTML = currentLines.map(line => `
                 <div class="dialogue-line">
                     <p>テキスト: ${line.text}</p>
-                    <p>話者: ${line.id === 0 ? "男性" : "つくよみ"}</p>
-                    <p>ピッチ: ${line.pitch}</p>
-                    <p>速度: ${line.speed}</p>
+                    <p>話者: ${line.id === 0 ? "男性" : "女性"}</p>
                 </div>
             `).join('');
         }
