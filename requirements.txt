@@ -1,2 +1,2 @@
-gTTS==2.4.6
+gTTS==2.5.4
 requests==2.31.0
